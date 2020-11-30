@@ -788,14 +788,10 @@ oss_audio_loop(cubeb_stream * s, cubeb_state *new_state)
   cubeb_state state = CUBEB_STATE_STOPPED;
   int trig = 0;
   int drain = 0;
-  unsigned int ppending;
   const bool play_on = s->play.fd != -1, record_on = s->record.fd != -1;
-  const bool duplex_on = play_on && record_on;
-  int rate = (play_on) ? s->play.info.sample_rate : s->record.info.sample_rate;
+  long nfr = s->bufframes;
 
-  ppending = 0;
-
-  if (s->record.fd != -1) {
+  if (record_on) {
     if (ioctl(s->record.fd, SNDCTL_DSP_SETTRIGGER, &trig)) {
       LOG("Error %d occured when setting trigger on record fd", errno);
       state = CUBEB_STATE_ERROR;
@@ -807,6 +803,8 @@ oss_audio_loop(cubeb_stream * s, cubeb_state *new_state)
       state = CUBEB_STATE_ERROR;
       goto breakdown;
     }
+
+    memset(s->record.buf, 0, s->bufframes * s->record.frame_size);
   }
 
   if (!play_on && !record_on) {
@@ -819,7 +817,6 @@ oss_audio_loop(cubeb_stream * s, cubeb_state *new_state)
   }
 
   while (1) {
-    long nfr = 0;
     pthread_mutex_lock(&s->mtx);
     if (!s->running || s->destroying) {
       pthread_mutex_unlock(&s->mtx);
@@ -827,49 +824,75 @@ oss_audio_loop(cubeb_stream * s, cubeb_state *new_state)
     }
     pthread_mutex_unlock(&s->mtx);
 
-    audio_buf_info bi;
-    if (record_on) {
-      if (ioctl(s->record.fd, SNDCTL_DSP_GETISPACE, &bi)) {
+    long got = 0;
+    if (nfr > 0) {
+      got = s->data_cb(s, s->user_ptr, s->record.buf, s->play.buf, nfr);
+      if (got == CUBEB_ERROR) {
         state = CUBEB_STATE_ERROR;
         goto breakdown;
       }
-      /*
-       * In duplex mode, recording drives playback direction.
-       */
-      nfr = bi.bytes / s->record.frame_size;
+      if (play_on) {
+        float vol;
+
+        pthread_mutex_lock(&s->mtx);
+        vol = s->volume;
+        pthread_mutex_unlock(&s->mtx);
+
+        if (s->play.floating) {
+          oss_float_to_linear32(s->play.buf, s->play.info.channels * got, vol);
+        } else {
+          oss_linear16_set_vol((int16_t *)s->play.buf,
+                               s->play.info.channels * got, vol);
+        }
+      }
+      if (got < nfr) {
+        if (s->play.fd != -1) {
+          drain = 1;
+        } else {
+          /*
+           * This is a record-only stream and number of frames
+           * returned from data_cb() is smaller than number
+           * of frames required to read. Stop here.
+           */
+
+          state = CUBEB_STATE_STOPPED;
+          goto breakdown;
+        }
+      }
+      nfr = 0;
     }
+
+    if (got > 0) {
+      if (play_on && oss_put_play_frames(s, got) < 0) {
+          state = CUBEB_STATE_ERROR;
+          goto breakdown;
+      }
+    }
+    if (drain) {
+      state = CUBEB_STATE_DRAINED;
+      goto breakdown;
+    }
+
+    audio_buf_info bi;
     if (play_on) {
       if (ioctl(s->play.fd, SNDCTL_DSP_GETOSPACE, &bi)) {
         state = CUBEB_STATE_ERROR;
         goto breakdown;
       }
-      if (!duplex_on) {
-        nfr = bi.bytes / s->play.frame_size;
+      /*
+       * In duplex mode, playback direction drives recording direction to
+       * prevent building up latencies.
+       */
+      nfr = bi.fragsize * bi.fragments / s->play.frame_size;
+      if (nfr > s->bufframes) {
+        nfr = s->bufframes;
       }
-    }
-    if (nfr > s->bufframes) {
-      nfr = s->bufframes;
-    }
-
-    if (nfr == 0) {
-      int error;
-      struct pollfd pfds[2];
-      pfds[0].fd = s->play.fd;
-      pfds[1].fd = s->record.fd;
-      pfds[0].events = POLLOUT;
-      pfds[1].events = POLLIN;
-      pfds[0].revents = pfds[1].revents = 0;
-      error = poll(pfds, 2, (s->nfr * 1000 + rate - 1) / rate);
-      if (error == -1) {
-        if (errno != EINTR) {
-          state = CUBEB_STATE_ERROR;
-          goto breakdown;
-        }
-      }
-      continue;
     }
 
     if (record_on) {
+      if (nfr == 0) {
+        nfr = s->nfr;
+      }
       if (oss_get_rec_frames(s, nfr) == CUBEB_ERROR) {
         state = CUBEB_STATE_ERROR;
         goto breakdown;
@@ -877,53 +900,6 @@ oss_audio_loop(cubeb_stream * s, cubeb_state *new_state)
       if (s->record.floating) {
         oss_linear32_to_float(s->record.buf, s->record.info.channels * nfr);
       }
-    }
-
-    long got = s->data_cb(s, s->user_ptr, s->record.buf, s->play.buf, nfr);
-    if (got == CUBEB_ERROR) {
-      state = CUBEB_STATE_ERROR;
-      goto breakdown;
-    }
-    if (play_on) {
-      float vol;
-
-      pthread_mutex_lock(&s->mtx);
-      vol = s->volume;
-      pthread_mutex_unlock(&s->mtx);
-
-      if (s->play.floating) {
-        oss_float_to_linear32(s->play.buf, s->play.info.channels * got, vol);
-      } else {
-        oss_linear16_set_vol((int16_t *)s->play.buf,
-                             s->play.info.channels * got, vol);
-      }
-
-      ppending = got;
-      assert(ppending <= s->bufframes);
-    }
-    if (got < nfr) {
-      if (s->play.fd != -1) {
-        drain = 1;
-      } else {
-        /*
-         * This is a record-only stream and number of frames
-         * returned from data_cb() is smaller than number
-         * of frames required to read. Stop here.
-         */
-
-        state = CUBEB_STATE_STOPPED;
-        goto breakdown;
-      }
-    }
-
-    if (play_on && oss_put_play_frames(s, ppending) < 0) {
-        state = CUBEB_STATE_ERROR;
-        goto breakdown;
-    }
-
-    if (drain) {
-      state = CUBEB_STATE_DRAINED;
-      goto breakdown;
     }
   }
 
